@@ -1,0 +1,3 @@
+train_file: data/processed/sft_train.json
+val_file: data/processed/sft_validation.json
+database_file: data/raw/spider/database

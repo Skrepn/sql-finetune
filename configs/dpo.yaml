@@ -1,0 +1,52 @@
+run_name: sql_dpo
+output_dir: runs/dpo
+
+# Core optimization.
+learning_rate: 2.0e-6
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 4
+num_train_epochs: 1
+max_steps: -1
+warmup_ratio: 0.1
+lr_scheduler_type: cosine
+optim: paged_adamw_8bit
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+# Logging / saving.
+logging_steps: 10
+logging_first_step: true
+save_strategy: steps
+save_steps: 200
+save_total_limit: 2
+
+# Evaluation.
+eval_strategy: steps
+eval_steps: 200
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+
+# Precision / memory.
+fp16: false
+bf16: false
+compute_dtype: float32
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+remove_unused_columns: false
+
+# DPO-specific.
+beta: 0.3
+label_smoothing: 0.0
+loss_type: sigmoid
+max_length: 512
+truncation_mode: keep_end
+precompute_ref_log_probs: true
+dataset_num_proc: null
+disable_dropout: true
+
+# Reproducibility / reporting.
+seed: 42
+report_to: none

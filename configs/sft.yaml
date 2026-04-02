@@ -1,0 +1,25 @@
+output_dir: runs/sft/qwen_coder_0_5b/checkpoints
+batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 1.2e-4
+num_epochs: 2
+eval_steps: 100
+save_steps: 100
+save_total_limit: 5
+logging_steps: 10
+
+warmup_ratio: 0.05
+lr_scheduler_type: cosine
+
+lora:
+  r: 8
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj

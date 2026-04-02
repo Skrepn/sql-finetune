@@ -1,0 +1,12 @@
+match: 1.0
+exec_mismatch: 0.1
+syntax_error: -0.2
+runtime_error: -0.4
+forbidden: -1.0
+timeout: -0.6
+unknown_error: -0.6
+
+length_penalty_weight: 0.0
+select_star_penalty: 0.0
+slow_query_ms: 0
+slow_query_penalty: 0.0

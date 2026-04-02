@@ -1,0 +1,4 @@
+model_name: Qwen/Qwen2.5-Coder-0.5B
+max_length: 768
+max_new_tokens: 128
+dtype: float16

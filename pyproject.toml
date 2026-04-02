@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sql-finetune"
+version = "0.1.0"
+description = "Fine-tuning and reinforcement learning pipeline for text-to-SQL models"
+readme = "README.md"
+requires-python = ">=3.10"cd
+license = { text = "MIT" }
+authors = [{ name = "Nikita Skripichnikov" }]
+
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.38",
+    "datasets>=2.18",
+    "peft>=0.9",
+    "trl>=0.8",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.28",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["sql_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
