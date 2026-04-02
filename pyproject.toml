@@ -7,7 +7,7 @@ name = "sql-finetune"
 version = "0.1.0"
 description = "Fine-tuning and reinforcement learning pipeline for text-to-SQL models"
 readme = "README.md"
-requires-python = ">=3.10"cd
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Nikita Skripichnikov" }]
 
