@@ -103,12 +103,10 @@ python scripts/train_sft.py
 # Stage 2: Collect rollouts
 python -m scripts.collect_rollout \
     --sft_adapter_dir runs/sft/.../final \
-    --temperature 0.8 --top_p 0.92
 
 # Stage 3: Build preference pairs
 python -m scripts.build_preferences \
     --rollouts_path runs/rollouts/.../rollouts.jsonl \
-    --min_reward_gap 0.1
 
 # Stage 4: DPO
 python -m scripts.train_dpo \
