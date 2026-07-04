@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, set_seed
 from sql_agent.dataset_utils.prompts import build_chatml_prompt
 from sql_agent.env.sql_sandbox import SqlErrorType, SqlSandbox
 from sql_agent.models.tokenizer import load_tokenizer
+from sql_agent.generation import extract_sql_from_generation
 from sql_agent.reward.execution_reward import (
     RewardConfig,
     compute_execution_reward,
@@ -35,86 +36,6 @@ from sql_agent.utils import (
     timestamp,
     write_jsonl_line,
 )
-
-
-def _strip_code_fences(text: str) -> str:
-    """Removes markdown code fences if present.
-
-    Args:
-        text: Decoded model output.
-
-    Returns:
-        Cleaned text without surrounding ````` fences.
-    """
-    t = text.strip()
-    if "```" not in t:
-        return t
-    t = t.replace("```sql", "```")
-    parts = t.split("```")
-    blocks = [p.strip() for p in parts if p.strip()]
-    if not blocks:
-        return text.strip()
-    return max(blocks, key=len)
-
-
-_NON_SQL_RE = re.compile(r"[^\x00-\x7F]")
-
-def _extract_sql_from_generated(
-    generated_text: str,
-    *,
-    im_end_token: str = "<|im_end|>",
-) -> str:
-    """Extracts SQL from raw model-generated text.
-
-    Applies multiple cleaning stages to isolate valid SQL:
-    1. Strip code fences.
-    2. Cut at ChatML end token.
-    3. Cut at first non-ASCII character.
-    4. Cut at corruption markers (special tokens, repeated newlines).
-    5. Cut at semicolon (take only first statement).
-    6. Validate that result looks like SQL.
-
-    Args:
-        generated_text: Raw decoded text from the model.
-        im_end_token: End-of-turn token to split on.
-
-    Returns:
-        Cleaned SQL string, or an empty string if no valid SQL found.
-    """
-    text = _strip_code_fences(generated_text)
-
-    if im_end_token in text:
-        text = text.split(im_end_token, 1)[0]
-
-    text = text.strip()
-
-    # Strip assistant prefix if model echoed it.
-    for marker in ("<|im_start|>assistant\n", "assistant\n"):
-        if text.startswith(marker):
-            text = text[len(marker):].strip()
-
-    non_ascii_match = _NON_SQL_RE.search(text)
-    if non_ascii_match:
-        text = text[:non_ascii_match.start()].strip()
-
-    # Cut at corruption markers.
-    corruption_markers = ["<|", "<quote", "```", "\n\n\n"]
-    cut_positions = [
-        text.find(m) for m in corruption_markers if m in text
-    ]
-    if cut_positions:
-        text = text[:min(cut_positions)].strip()
-
-    # Take only the first SQL statement.
-    if ";" in text:
-        text = text.split(";", 1)[0].strip()
-
-    # Validate: must start with SELECT or WITH.
-    lowered = text.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return ""
-
-    return text.strip()
 
 
 def _classify_difficulty(gold_sql: str) -> str:
@@ -268,6 +189,7 @@ def _evaluate_one(
     example: dict[str, Any],
     max_length: int,
     max_new_tokens: int,
+    repetition_penalty: float = 1.0,
 ) -> dict[str, Any]:
     """Generates SQL for one example and scores it.
 
@@ -310,7 +232,6 @@ def _evaluate_one(
             "do_sample": False,
             "max_new_tokens": max_new_tokens,
             "pad_token_id": tokenizer.pad_token_id,
-            "repetition_penalty": 1.2,
         }
         if eos_token_ids is not None:
             generate_kwargs["eos_token_id"] = eos_token_ids
@@ -319,7 +240,7 @@ def _evaluate_one(
 
     gen_ids = output[0, input_ids.shape[1]:]
     raw_output = tokenizer.decode(gen_ids, skip_special_tokens=False)
-    predicted_sql = _extract_sql_from_generated(raw_output)
+    predicted_sql = extract_sql_from_generation(raw_output)
 
     # Compute reward via execution.
     difficulty = _classify_difficulty(gold_sql)
@@ -448,6 +369,14 @@ def _parse_args() -> argparse.Namespace:
         default="runs/eval",
         help="Root directory for evaluation outputs.",
     )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty at eval decoding (1.0 = off)."
+            "Old runs used a hardcoded 1.2."
+
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=128)
@@ -531,6 +460,7 @@ def _evaluate_adapter(
                 example=example,
                 max_length=max_length,
                 max_new_tokens=args.max_new_tokens,
+                repetition_penalty=args.repetition_penalty,
             )
             result["example_idx"] = idx
             results.append(result)

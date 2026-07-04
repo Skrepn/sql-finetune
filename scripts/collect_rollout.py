@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
-import re
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -18,6 +17,7 @@ from sql_agent.dataset_utils.prompts import build_chatml_prompt
 from sql_agent.env.sql_sandbox import SqlErrorType, SqlSandbox
 from sql_agent.models.tokenizer import load_tokenizer
 from sql_agent.reward.execution_reward import RewardConfig, compute_execution_reward
+from sql_agent.generation import extract_sql_from_generation
 from sql_agent.utils import (
     build_quantization_config,
     load_config,
@@ -28,86 +28,6 @@ from sql_agent.utils import (
     timestamp,
     write_jsonl_line,
 )
-
-
-def _strip_code_fences(text: str) -> str:
-    """Removes markdown code fences if present.
-
-    Args:
-        text: Decoded model output.
-
-    Returns:
-        Cleaned text without surrounding ````` fences.
-    """
-    t = text.strip()
-    if "```" not in t:
-        return t
-    t = t.replace("```sql", "```")
-    parts = t.split("```")
-    blocks = [p.strip() for p in parts if p.strip()]
-    if not blocks:
-        return text.strip()
-    return max(blocks, key=len)
-
-
-_NON_SQL_RE = re.compile(r"[^\x00-\x7F]")
-
-def _extract_sql_from_generated(
-    generated_text: str,
-    *,
-    im_end_token: str = "<|im_end|>",
-) -> str:
-    """Extracts SQL from raw model-generated text.
-
-    Applies multiple cleaning stages to isolate valid SQL:
-    1. Strip code fences.
-    2. Cut at ChatML end token.
-    3. Cut at first non-ASCII character.
-    4. Cut at corruption markers (special tokens, repeated newlines).
-    5. Cut at semicolon (take only first statement).
-    6. Validate that result looks like SQL.
-
-    Args:
-        generated_text: Raw decoded text from the model.
-        im_end_token: End-of-turn token to split on.
-
-    Returns:
-        Cleaned SQL string, or an empty string if no valid SQL found.
-    """
-    text = _strip_code_fences(generated_text)
-
-    if im_end_token in text:
-        text = text.split(im_end_token, 1)[0]
-
-    text = text.strip()
-
-    # Strip assistant prefix if model echoed it.
-    for marker in ("<|im_start|>assistant\n", "assistant\n"):
-        if text.startswith(marker):
-            text = text[len(marker):].strip()
-
-    non_ascii_match = _NON_SQL_RE.search(text)
-    if non_ascii_match:
-        text = text[:non_ascii_match.start()].strip()
-
-    # Cut at corruption markers.
-    corruption_markers = ["<|", "<quote", "```", "\n\n", "\nSELECT", "\nWITH"]
-    cut_positions = [
-        text.find(m) for m in corruption_markers if m in text
-    ]
-    if cut_positions:
-        text = text[:min(cut_positions)].strip()
-
-    # Take only the first SQL statement.
-    if ";" in text:
-        text = text.split(";", 1)[0].strip()
-
-    # Validate: must start with SELECT or WITH.
-    lowered = text.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return ""
-
-    return text.strip()
 
 
 def _load_policy_model(
@@ -376,7 +296,7 @@ def main() -> None:
                 decoded = tokenizer.decode(
                     gen_ids, skip_special_tokens=False
                 )
-                candidate_sql = _extract_sql_from_generated(decoded)
+                candidate_sql = extract_sql_from_generation(decoded)
 
                 try:
                     reward_res = compute_execution_reward(
