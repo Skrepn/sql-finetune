@@ -316,6 +316,10 @@ def _build_training_args(
     if max_length is not None:
         max_length = int(max_length)
 
+    max_prompt_length = _cfg_get(dpo_cfg, "max_prompt_length", None)
+    if max_prompt_length is not None:
+        max_prompt_length = int(max_prompt_length)
+
     gradient_checkpointing = bool(
         _cfg_get(dpo_cfg, "gradient_checkpointing", True)
     )
@@ -399,6 +403,7 @@ def _build_training_args(
         ),
         loss_type=str(_cfg_get(dpo_cfg, "loss_type", "sigmoid")),
         max_length=max_length,
+        max_prompt_length=max_prompt_length,
         truncation_mode=str(
             _cfg_get(dpo_cfg, "truncation_mode", "keep_start")
         ),
@@ -413,6 +418,37 @@ def _build_training_args(
         logging_first_step=bool(
             _cfg_get(dpo_cfg, "logging_first_step", True)
         ),
+    )
+
+
+def _log_token_length_stats(
+    dataset: Dataset,
+    tokenizer: Any,
+    max_prompt_length: Optional[int],
+    max_length: Optional[int],
+) -> None:
+    """Logs how many preference rows exceed the token budgets."""
+    over_prompt = 0
+    over_total = 0
+    for row in dataset:
+        prompt_len = len(
+            tokenizer(row["prompt"], add_special_tokens=False)["input_ids"]
+        )
+        completion_len = max(
+            len(tokenizer(row["chosen"], add_special_tokens=False)["input_ids"]),
+            len(tokenizer(row["rejected"], add_special_tokens=False)["input_ids"]),
+        )
+        if max_prompt_length is not None and prompt_len > max_prompt_length:
+            over_prompt += 1
+        if max_length is not None and completion_len + prompt_len > max_length:
+            over_total += 1
+    logging.info(
+        "Token budgets: %d/%d rows exceed max_prompt_length, "
+        "%d/%d exceed max_length.",
+        over_prompt,
+        len(dataset),
+        over_total,
+        len(dataset),
     )
 
 
@@ -501,6 +537,12 @@ def main() -> None:
         model.print_trainable_parameters()
 
     training_args = _build_training_args(dpo_cfg, run_dir, tokenizer)
+    _log_token_length_stats(
+        train_dataset,
+        tokenizer,
+        training_args.max_prompt_length,
+        training_args.max_length,
+    )
     if training_args.eval_strategy != "no" and eval_dataset is None:
         raise ValueError(
             "Evaluation is enabled in dpo config, but --eval_preferences_path "
