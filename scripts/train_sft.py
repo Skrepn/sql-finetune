@@ -16,6 +16,7 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from transformers import (
     AutoModelForCausalLM,
     DataCollatorForSeq2Seq,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -239,6 +240,13 @@ def main() -> None:
         eval_dataset=val_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=int(
+                    sft_cfg.get("early_stopping_patience", 3)
+                ),
+            ),
+        ],
     )
 
     logging.info("Starting SFT training.")
