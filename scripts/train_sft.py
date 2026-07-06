@@ -52,56 +52,41 @@ def _format_example(example: dict[str, str]) -> dict[str, str]:
 def _tokenize_batch(
     batch: dict[str, list[str]],
     tokenizer: Any,
-    max_length: int,
 ) -> dict[str, list[list[int]]]:
-    """Tokenizes a batch and applies label masking on prompt tokens.
-
-    The prompt portion and any padding tokens are masked with ``-100``
-    in the labels so that the training loss is computed only on the
-    SQL completion.
+    """Tokenizes prompt and completion separately and concatenates them.
 
     Args:
-        batch: Batch dictionary with ``prompt`` and ``completion``
-            string lists.
-        tokenizer: HuggingFace tokenizer instance.
-        max_length: Maximum total sequence length.
+        batch: A batch of examples.
+        tokenizer: Tokenizer instance.
 
     Returns:
-        Tokenized dictionary with ``input_ids``, ``attention_mask``,
-        and ``labels``.
+        A dict with ``input_ids``, ``attention_mask`` and ``labels``.
     """
-    prompts = batch["prompt"]
-    completions = batch["completion"]
+    prompt_ids_list = tokenizer(
+        batch["prompt"], add_special_tokens=False
+    )["input_ids"]
+    completion_ids_list = tokenizer(
+        batch["completion"], add_special_tokens=False
+    )["input_ids"]
 
-    full_texts = [p + c for p, c in zip(prompts, completions)]
+    input_ids: list[list[int]] = []
+    attention_mask: list[list[int]] = []
+    labels: list[list[int]] = []
 
-    tokenized = tokenizer(
-        full_texts,
-        truncation=True,
-        padding=False,
-        add_special_tokens=False,
-        max_length=max_length,
-    )
+    for prompt_ids, completion_ids in zip(
+        prompt_ids_list, completion_ids_list
+    ):
+        input_ids.append(prompt_ids + completion_ids)
+        attention_mask.append(
+            [1] * (len(prompt_ids) + len(completion_ids))
+        )
+        labels.append([-100] * len(prompt_ids) + list(completion_ids))
 
-    input_ids = tokenized["input_ids"]
-    labels = [ids.copy() for ids in input_ids]
-
-    for i, prompt in enumerate(prompts):
-        prompt_ids = tokenizer(
-            prompt,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=max_length,
-        )["input_ids"]
-
-        prompt_len = len(prompt_ids)
-
-        # Mask prompt tokens.
-        for j in range(prompt_len):
-            labels[i][j] = -100
-
-    tokenized["labels"] = labels
-    return tokenized
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
 
 
 def _process_dataset(
@@ -109,12 +94,12 @@ def _process_dataset(
     tokenizer: Any,
     max_length: int,
 ) -> Dataset:
-    """Applies formatting and tokenization to a dataset split.
+    """Applies formatting, tokenization, and length filtering.
 
     Args:
         dataset: Raw HuggingFace dataset.
         tokenizer: Tokenizer instance.
-        max_length: Maximum sequence length.
+        max_length: Maximum sequence length; longer examples are dropped.
 
     Returns:
         Tokenized dataset ready for ``Trainer``.
@@ -124,10 +109,23 @@ def _process_dataset(
         remove_columns=dataset.column_names,
     )
     dataset = dataset.map(
-        lambda batch: _tokenize_batch(batch, tokenizer, max_length),
+        lambda batch: _tokenize_batch(batch, tokenizer),
         batched=True,
         remove_columns=["prompt", "completion"],
     )
+
+    before = len(dataset)
+    dataset = dataset.filter(
+        lambda example: len(example["input_ids"]) <= max_length
+    )
+    dropped = before - len(dataset)
+    if dropped:
+        logging.warning(
+            "Dropped %d/%d examples longer than max_length=%d",
+            dropped,
+            before,
+            max_length,
+        )
     return dataset
 
 
