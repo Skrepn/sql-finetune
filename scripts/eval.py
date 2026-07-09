@@ -57,7 +57,11 @@ def _classify_difficulty(gold_sql: str) -> str:
 
     # Count structural elements.
     num_joins = len(re.findall(r"\bjoin\b", sql_lower))
-    has_subquery = "select" in sql_lower[sql_lower.find("from") + 4:] if "from" in sql_lower else False
+    has_subquery = (
+        "select" in sql_lower[sql_lower.find("from") + 4:]
+        if "from" in sql_lower
+        else False
+    )
     has_group_by = "group by" in sql_lower
     has_order_by = "order by" in sql_lower
     has_having = "having" in sql_lower
@@ -179,52 +183,45 @@ def _iter_examples(
         yield dict(ds[i])
 
 
-def _evaluate_one(
+def _generate_sql_batch(
     model: Any,
     tokenizer: Any,
     device: Any,
     eos_token_ids: Optional[list[int]],
-    sandbox: SqlSandbox,
-    reward_config: RewardConfig,
-    example: dict[str, Any],
+    prompts: list[str],
     max_length: int,
     max_new_tokens: int,
-    repetition_penalty: float = 1.0,
-) -> dict[str, Any]:
-    """Generates SQL for one example and scores it.
+    repetition_penalty: float,
+) -> list[str]:
+    """Greedy-generates SQL for a batch of prompts.
+
+    Requires ``tokenizer.padding_side == "left"`` so generated tokens
+    start at the same position for every row.
 
     Args:
         model: Loaded model.
-        tokenizer: Tokenizer.
-        device: Torch device.
+        tokenizer: Tokenizer matching the model.
+        device: Device to run generation on.
         eos_token_ids: List of EOS token IDs.
-        sandbox: SQL execution sandbox.
-        reward_config: Reward configuration.
-        example: Dataset example dict.
+        prompts: Fully formatted prompts, one per example.
         max_length: Max prompt length.
         max_new_tokens: Max tokens to generate.
+        repetition_penalty: Penalty for repeated tokens, 1.0 means no penalty.
 
     Returns:
-        Result dictionary with prediction and metrics.
+        Extracted SQL string, one per prompt, in the same order.
     """
-    question = example.get("question", "")
-    schema = example.get("schema", "")
-    gold_sql = example.get("sql", "")
-    db_id = example.get("db_id", "")
-
-    prompt = build_chatml_prompt(schema=schema, question=question)
-
     enc = tokenizer(
-        prompt,
+        prompts,
         return_tensors="pt",
-        add_special_tokens=False,
+        padding=True,
         truncation=True,
         max_length=max_length,
+        add_special_tokens=False,
     )
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
 
-    # Greedy decoding - deterministic, no sampling.
     with torch.inference_mode():
         generate_kwargs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -233,16 +230,38 @@ def _evaluate_one(
             "max_new_tokens": max_new_tokens,
             "pad_token_id": tokenizer.pad_token_id,
         }
+        if repetition_penalty != 1.0:
+            generate_kwargs["repetition_penalty"] = repetition_penalty
         if eos_token_ids is not None:
             generate_kwargs["eos_token_id"] = eos_token_ids
 
-        output = model.generate(**generate_kwargs)
+        outputs = model.generate(**generate_kwargs)
 
-    gen_ids = output[0, input_ids.shape[1]:]
-    raw_output = tokenizer.decode(gen_ids, skip_special_tokens=False)
-    predicted_sql = extract_sql_from_generation(raw_output)
+    gen_ids = outputs[:, input_ids.shape[1]:]
+    decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
+    return [extract_sql_from_generation(text) for text in decoded]
 
-    # Compute reward via execution.
+
+def _score_example(
+    sandbox: SqlSandbox,
+    reward_config: RewardConfig,
+    example: dict[str, Any],
+    predicted_sql: str,
+) -> dict[str, Any]:
+    """Executes predicted SQL against gold and builds the result row.
+
+    Args:
+        sandbox: SQL execution sandbox.
+        reward_config: Settings for reward computation.
+        example: Dataset example with "question", "sql" and "db_id" keys.
+        predicted_sql: SQL generation by the model.
+
+    Returns:
+        Result row with match status, reward, error type and difficulty.
+    """
+    question = example.get("question", "")
+    gold_sql = example.get("sql", "")
+    db_id = example.get("db_id", "")
     difficulty = _classify_difficulty(gold_sql)
 
     try:
@@ -254,7 +273,6 @@ def _evaluate_one(
             config=reward_config,
             strict_gold=False,
         )
-
         return {
             "question": question,
             "db_id": db_id,
@@ -267,7 +285,6 @@ def _evaluate_one(
             "difficulty": difficulty,
             "gold_failed": reward_res.reason == "gold_failed",
         }
-
     except Exception as exc:
         logging.warning("Evaluation failed for db_id=%s: %s", db_id, exc)
         return {
@@ -356,7 +373,7 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Evaluate the raw pretrained model (no adapter) for comparison. "
-             "Use --no-include-base to skip.",
+             "Use --no-include_base to skip.",
     )
     parser.add_argument(
         "--split",
@@ -373,10 +390,16 @@ def _parse_args() -> argparse.Namespace:
         "--repetition_penalty",
         type=float,
         default=1.0,
-        help="Repetition penalty at eval decoding (1.0 = off)."
-            "Old runs used a hardcoded 1.2."
-
+        help="Repetition penalty at eval decoding (1.0 = off). "
+             "Old runs used a hardcoded 1.2.",
     )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=8,
+        help="Prompts per generation batch.",
+    )
+
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=128)
@@ -430,68 +453,87 @@ def _evaluate_adapter(
 
     model, device = _load_model(model_name, dtype, adapter_dir)
     tokenizer = load_tokenizer(model_name)
+    tokenizer.padding_side = "left"
     eos_token_ids = _configure_generation_tokens(model, tokenizer)
     max_length = int(model_cfg.get("max_length", 2048))
 
     logging.info("Model loaded. Device: %s", device)
 
-    # Evaluate each example.
     results: list[dict[str, Any]] = []
     start_time = time.time()
-
     results_path = run_dir / f"results_{safe_name}.jsonl"
+    skipped_incomplete = 0
+
+    def _flush_batch(batch: list[dict[str, Any]], out_fp: Any) -> None:
+        """Generates and scores SQL for the batch."""
+        prompts = [
+            build_chatml_prompt(schema=ex["schema"], question=ex["question"])
+            for ex in batch
+        ]
+        predicted = _generate_sql_batch(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            eos_token_ids=eos_token_ids,
+            prompts=prompts,
+            max_length=max_length,
+            max_new_tokens=args.max_new_tokens,
+            repetition_penalty=args.repetition_penalty,
+        )
+        for ex, sql in zip(batch, predicted):
+            result = _score_example(sandbox, reward_config, ex, sql)
+            result["example_idx"] = ex["_idx"]
+            results.append(result)
+            write_jsonl_line(out_fp, result)
 
     with results_path.open("w", encoding="utf-8") as f:
+        batch: list[dict[str, Any]] = []
         for idx, example in enumerate(
             _iter_examples(data_file, max_examples=args.max_examples)
         ):
             if not all(
                 example.get(k) for k in ("question", "schema", "sql", "db_id")
             ):
+                skipped_incomplete += 1
                 continue
 
-            result = _evaluate_one(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                eos_token_ids=eos_token_ids,
-                sandbox=sandbox,
-                reward_config=reward_config,
-                example=example,
-                max_length=max_length,
-                max_new_tokens=args.max_new_tokens,
-                repetition_penalty=args.repetition_penalty,
-            )
-            result["example_idx"] = idx
-            results.append(result)
-            write_jsonl_line(f, result)
+            example["_idx"] = idx
+            batch.append(example)
 
-            if (idx + 1) % 25 == 0:
+            if len(batch) >= args.eval_batch_size:
+                _flush_batch(batch, f)
+                batch = []
+                # Free unused GPU memory.
+                torch.cuda.empty_cache()
+
                 current_acc = sum(
                     1 for r in results if r["matched"]
                 ) / len(results)
                 elapsed = time.time() - start_time
-                speed = len(results) / elapsed
                 logging.info(
-                    "Progress: %d examples | accuracy=%.3f | "
-                    "speed=%.1f ex/s",
+                    "Progress: %d examples | accuracy=%.3f | speed=%.2f ex/s",
                     len(results),
                     current_acc,
-                    speed,
+                    len(results) / elapsed
                 )
 
-            if (idx + 1) % 10 == 0:
-                torch.cuda.empty_cache()
+        if batch:
+            _flush_batch(batch, f)
 
-    elapsed_total = time.time() - start_time
+    elapsed = time.time() - start_time
+
+    if skipped_incomplete:
+        logging.warning(
+            "Skipped %d examples with missing fields.", skipped_incomplete
+        )
 
     # Compute metrics.
     metrics = _compute_metrics(results)
     metrics["adapter_dir"] = adapter_dir.as_posix() if adapter_dir else None
     metrics["label"] = label
-    metrics["elapsed_seconds"] = round(elapsed_total, 1)
+    metrics["elapsed_seconds"] = round(elapsed, 1)
     metrics["examples_per_second"] = (
-        round(len(results) / elapsed_total, 2) if elapsed_total > 0 else 0.0
+        round(len(results) / elapsed, 2) if elapsed > 0 else 0.0
     )
 
     # Log summary.
@@ -522,7 +564,7 @@ def _evaluate_adapter(
     logging.info("Error breakdown: %s", metrics["by_reason"])
     logging.info(
         "Time: %.1fs (%.1f examples/s)",
-        elapsed_total,
+        elapsed,
         metrics["examples_per_second"],
     )
     logging.info("-" * 60)
@@ -733,6 +775,8 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "results": all_metrics,
         "comparison_vs_base": comparison if comparison else None,
+        "eval_batch_size": args.eval_batch_size,
+        "repetition_penalty": args.repetition_penalty,
     }
     save_json(run_dir / "eval_summary.json", summary)
 
