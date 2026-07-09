@@ -244,6 +244,8 @@ def main() -> None:
     total = 0
     kept = 0
     matches = 0
+    examples_done = 0
+    examples_with_match = 0
 
     with rollouts_path.open("w", encoding="utf-8") as f:
         for idx, ex in enumerate(
@@ -290,6 +292,8 @@ def main() -> None:
                 outputs = model.generate(**generate_kwargs)
 
             # Score each candidate.
+            kept_before = kept
+            example_matched = False
             for k in range(outputs.shape[0]):
                 total += 1
                 gen_ids = outputs[k, input_ids.shape[1] :]
@@ -317,6 +321,7 @@ def main() -> None:
 
                 if reward_res.matched:
                     matches += 1
+                    example_matched = True
 
                 record = {
                     "id": f"{args.split}-{idx:06d}",
@@ -340,6 +345,11 @@ def main() -> None:
                 write_jsonl_line(f, record)
                 kept += 1
 
+            if kept > kept_before:
+                examples_done += 1
+                if example_matched:
+                    examples_with_match += 1
+
             if (idx + 1) % 10 == 0:
                 torch.cuda.empty_cache()
 
@@ -355,11 +365,18 @@ def main() -> None:
                 )
 
     match_rate = (matches / kept) if kept else 0.0
+    example_match_rate = (
+        (examples_with_match / examples_done) if examples_done else 0.0
+    )
     logging.info(
-        "Done. candidates=%d kept=%d match_rate=%.3f",
+        "Done. candidates=%d kept=%d match_rate=%.3f | "
+        "examples_with_match=%d/%d (%.3f)",
         total,
         kept,
         match_rate,
+        examples_with_match,
+        examples_done,
+        example_match_rate,
     )
     logging.info("Rollouts saved to: %s", rollouts_path)
 
