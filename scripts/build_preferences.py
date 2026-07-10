@@ -32,6 +32,8 @@ class PreferenceBuilderConfig:
         allow_ties: If ``True``, pairs with ``gap == 0`` are included.
         max_pairs_per_example: Maximum number of pairs to emit per
             example group.
+        require_chosen_matched: If ``True``, emit a pair only when the
+            chosen candidate matched the gold result set.
     """
 
     min_reward_gap: float = 0.3
@@ -39,6 +41,7 @@ class PreferenceBuilderConfig:
     require_exec_ok: bool = False
     allow_ties: bool = False
     max_pairs_per_example: int = 1
+    require_chosen_matched: bool = True
 
 
 @dataclasses.dataclass
@@ -51,6 +54,7 @@ class Stats:
     examples_skipped_gap: int = 0
     examples_skipped_no_valid: int = 0
     preferences_written: int = 0
+    examples_skipped_chosen_not_matched: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Converts the statistics into a dictionary."""
@@ -93,6 +97,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on the number of example groups to process.",
+    )
+    parser.add_argument(
+        "--require_chosen_matched",
+        action="store_true",
+        default=True,
+        help="Emit a pair only if the chosen candidate matched the gold."
+    )
+    parser.add_argument(
+        "--no_require_chosen_matched",
+        action="store_false",
+        dest="require_chosen_matched",
+        help="Allow non-matched candidates as chosen."
     )
 
     return parser.parse_args()
@@ -198,6 +214,9 @@ def _pick_pairs_for_group(
 
     chosen = eligible[0]
 
+    if cfg.require_chosen_matched and not chosen.get("matched", False):
+        return []
+
     # Iterate from worst to best so gap only shrinks.
     rejected_pool = list(reversed(eligible))
 
@@ -241,6 +260,7 @@ def main() -> None:
         require_exec_ok=bool(args.require_exec_ok),
         allow_ties=bool(args.allow_ties),
         max_pairs_per_example=int(args.max_pairs_per_example),
+        require_chosen_matched=bool(args.require_chosen_matched),
     )
 
     run_dir = Path(args.output_dir) / f"preferences_{timestamp()}"
@@ -290,6 +310,10 @@ def main() -> None:
                 eligible = [r for r in rows if _candidate_ok(r, cfg)]
                 if len(eligible) < 2:
                     stats.examples_skipped_no_valid += 1
+                elif cfg.require_chosen_matched and not any(
+                    r.get("matched", False) for r in eligible
+                ):
+                    stats.examples_skipped_chosen_not_matched += 1
                 else:
                     stats.examples_skipped_gap += 1
                 continue

@@ -41,7 +41,8 @@ remove_unused_columns: false
 beta: 0.3
 label_smoothing: 0.0
 loss_type: sigmoid
-max_length: 512
+max_length: 768
+max_prompt_length: 640
 truncation_mode: keep_end
 precompute_ref_log_probs: true
 dataset_num_proc: null

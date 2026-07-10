@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
-import re
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -18,6 +17,7 @@ from sql_agent.dataset_utils.prompts import build_chatml_prompt
 from sql_agent.env.sql_sandbox import SqlErrorType, SqlSandbox
 from sql_agent.models.tokenizer import load_tokenizer
 from sql_agent.reward.execution_reward import RewardConfig, compute_execution_reward
+from sql_agent.generation import extract_sql_from_generation
 from sql_agent.utils import (
     build_quantization_config,
     load_config,
@@ -28,86 +28,6 @@ from sql_agent.utils import (
     timestamp,
     write_jsonl_line,
 )
-
-
-def _strip_code_fences(text: str) -> str:
-    """Removes markdown code fences if present.
-
-    Args:
-        text: Decoded model output.
-
-    Returns:
-        Cleaned text without surrounding ````` fences.
-    """
-    t = text.strip()
-    if "```" not in t:
-        return t
-    t = t.replace("```sql", "```")
-    parts = t.split("```")
-    blocks = [p.strip() for p in parts if p.strip()]
-    if not blocks:
-        return text.strip()
-    return max(blocks, key=len)
-
-
-_NON_SQL_RE = re.compile(r"[^\x00-\x7F]")
-
-def _extract_sql_from_generated(
-    generated_text: str,
-    *,
-    im_end_token: str = "<|im_end|>",
-) -> str:
-    """Extracts SQL from raw model-generated text.
-
-    Applies multiple cleaning stages to isolate valid SQL:
-    1. Strip code fences.
-    2. Cut at ChatML end token.
-    3. Cut at first non-ASCII character.
-    4. Cut at corruption markers (special tokens, repeated newlines).
-    5. Cut at semicolon (take only first statement).
-    6. Validate that result looks like SQL.
-
-    Args:
-        generated_text: Raw decoded text from the model.
-        im_end_token: End-of-turn token to split on.
-
-    Returns:
-        Cleaned SQL string, or an empty string if no valid SQL found.
-    """
-    text = _strip_code_fences(generated_text)
-
-    if im_end_token in text:
-        text = text.split(im_end_token, 1)[0]
-
-    text = text.strip()
-
-    # Strip assistant prefix if model echoed it.
-    for marker in ("<|im_start|>assistant\n", "assistant\n"):
-        if text.startswith(marker):
-            text = text[len(marker):].strip()
-
-    non_ascii_match = _NON_SQL_RE.search(text)
-    if non_ascii_match:
-        text = text[:non_ascii_match.start()].strip()
-
-    # Cut at corruption markers.
-    corruption_markers = ["<|", "<quote", "```", "\n\n", "\nSELECT", "\nWITH"]
-    cut_positions = [
-        text.find(m) for m in corruption_markers if m in text
-    ]
-    if cut_positions:
-        text = text[:min(cut_positions)].strip()
-
-    # Take only the first SQL statement.
-    if ";" in text:
-        text = text.split(";", 1)[0].strip()
-
-    # Validate: must start with SELECT or WITH.
-    lowered = text.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return ""
-
-    return text.strip()
 
 
 def _load_policy_model(
@@ -247,6 +167,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--database_root", default=None)
     parser.add_argument("--timeout_s", type=float, default=2.0)
     parser.add_argument("--max_rows", type=int, default=200)
+    parser.add_argument(
+        "--keep_empty_gold",
+        action="store_true",
+        help="Keep examples whose gold query returns an empty result"
+    )
 
     return parser.parse_args()
 
@@ -318,12 +243,17 @@ def main() -> None:
             "max_rows": args.max_rows,
         },
         "reward": dataclasses.asdict(reward_config),
+        "keep_empty_gold": args.keep_empty_gold,
     }
     save_run_meta(run_dir, meta)
 
     total = 0
     kept = 0
     matches = 0
+    examples_done = 0
+    examples_with_match = 0
+    skipped_empty_gold = 0
+    skipped_gold_failed = 0
 
     with rollouts_path.open("w", encoding="utf-8") as f:
         for idx, ex in enumerate(
@@ -338,6 +268,20 @@ def main() -> None:
                 logging.warning(
                     "Skipping example %d due to missing fields.", idx
                 )
+                continue
+
+            gold_res = sandbox.execute(db_id=db_id, sql=gold_sql)
+            if not gold_res.ok:
+                skipped_gold_failed += 1
+                logging.warning(
+                    "Skipped example %d: gold SQL failed (%s).",
+                    idx,
+                    gold_res.error_type.value,
+                )
+                continue
+
+            if not gold_res.rows and not args.keep_empty_gold:
+                skipped_empty_gold += 1
                 continue
 
             prompt = build_chatml_prompt(schema=schema, question=question)
@@ -370,13 +314,15 @@ def main() -> None:
                 outputs = model.generate(**generate_kwargs)
 
             # Score each candidate.
+            kept_before = kept
+            example_matched = False
             for k in range(outputs.shape[0]):
                 total += 1
                 gen_ids = outputs[k, input_ids.shape[1] :]
                 decoded = tokenizer.decode(
                     gen_ids, skip_special_tokens=False
                 )
-                candidate_sql = _extract_sql_from_generated(decoded)
+                candidate_sql = extract_sql_from_generation(decoded)
 
                 try:
                     reward_res = compute_execution_reward(
@@ -397,6 +343,7 @@ def main() -> None:
 
                 if reward_res.matched:
                     matches += 1
+                    example_matched = True
 
                 record = {
                     "id": f"{args.split}-{idx:06d}",
@@ -420,6 +367,11 @@ def main() -> None:
                 write_jsonl_line(f, record)
                 kept += 1
 
+            if kept > kept_before:
+                examples_done += 1
+                if example_matched:
+                    examples_with_match += 1
+
             if (idx + 1) % 10 == 0:
                 torch.cuda.empty_cache()
 
@@ -435,13 +387,27 @@ def main() -> None:
                 )
 
     match_rate = (matches / kept) if kept else 0.0
+    example_match_rate = (
+        (examples_with_match / examples_done) if examples_done else 0.0
+    )
     logging.info(
-        "Done. candidates=%d kept=%d match_rate=%.3f",
+        "Done. candidates=%d kept=%d match_rate=%.3f | "
+        "examples_with_match=%d/%d (%.3f)",
         total,
         kept,
         match_rate,
+        examples_with_match,
+        examples_done,
+        example_match_rate,
     )
     logging.info("Rollouts saved to: %s", rollouts_path)
+
+    if skipped_empty_gold or skipped_gold_failed:
+        logging.info(
+            "Skipped examples: empty_gold=%d, gold_failed=%d",
+            skipped_empty_gold,
+            skipped_gold_failed,
+        )
 
 
 if __name__ == "__main__":

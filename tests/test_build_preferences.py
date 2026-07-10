@@ -66,9 +66,12 @@ def test_pick_pairs_respects_min_gap_and_ties() -> None:
     """_pick_pairs_for_group enforces min_reward_gap and allow_ties."""
     mod = _load_module()
     rows = [
-        {"candidate_id": 0, "reward": 1.0, "valid": True, "exec_ok": True},
-        {"candidate_id": 1, "reward": 0.9, "valid": True, "exec_ok": True},
-        {"candidate_id": 2, "reward": 0.0, "valid": True, "exec_ok": True},
+        {"candidate_id": 0, "reward": 1.0, "valid": True, "exec_ok": True,
+         "matched": True},
+        {"candidate_id": 1, "reward": 0.9, "valid": True, "exec_ok": True,
+         "matched": False},
+        {"candidate_id": 2, "reward": 0.0, "valid": True, "exec_ok": True,
+         "matched": False},
     ]
 
     cfg = mod.PreferenceBuilderConfig(min_reward_gap=0.5, allow_ties=False)
@@ -79,8 +82,10 @@ def test_pick_pairs_respects_min_gap_and_ties() -> None:
     cfg = mod.PreferenceBuilderConfig(min_reward_gap=0.5, allow_ties=True)
     pairs = mod._pick_pairs_for_group(
         [
-            {"candidate_id": 0, "reward": 1.0, "valid": True, "exec_ok": True},
-            {"candidate_id": 1, "reward": 1.0, "valid": True, "exec_ok": True},
+            {"candidate_id": 0, "reward": 1.0, "valid": True, "exec_ok": True,
+             "matched": True},
+            {"candidate_id": 1, "reward": 1.0, "valid": True, "exec_ok": True,
+             "matched": True},
         ],
         cfg,
     )
