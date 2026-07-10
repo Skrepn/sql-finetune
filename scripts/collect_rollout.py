@@ -167,6 +167,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--database_root", default=None)
     parser.add_argument("--timeout_s", type=float, default=2.0)
     parser.add_argument("--max_rows", type=int, default=200)
+    parser.add_argument(
+        "--keep_empty_gold",
+        action="store_true",
+        help="Keep examples whose gold query returns an empty result"
+    )
 
     return parser.parse_args()
 
@@ -238,6 +243,7 @@ def main() -> None:
             "max_rows": args.max_rows,
         },
         "reward": dataclasses.asdict(reward_config),
+        "keep_empty_gold": args.keep_empty_gold,
     }
     save_run_meta(run_dir, meta)
 
@@ -246,6 +252,8 @@ def main() -> None:
     matches = 0
     examples_done = 0
     examples_with_match = 0
+    skipped_empty_gold = 0
+    skipped_gold_failed = 0
 
     with rollouts_path.open("w", encoding="utf-8") as f:
         for idx, ex in enumerate(
@@ -260,6 +268,20 @@ def main() -> None:
                 logging.warning(
                     "Skipping example %d due to missing fields.", idx
                 )
+                continue
+
+            gold_res = sandbox.execute(db_id=db_id, sql=gold_sql)
+            if not gold_res.ok:
+                skipped_gold_failed += 1
+                logging.warning(
+                    "Skipped example %d: gold SQL failed (%s).",
+                    idx,
+                    gold_res.error_type.value,
+                )
+                continue
+
+            if not gold_res.rows and not args.keep_empty_gold:
+                skipped_empty_gold += 1
                 continue
 
             prompt = build_chatml_prompt(schema=schema, question=question)
@@ -379,6 +401,13 @@ def main() -> None:
         example_match_rate,
     )
     logging.info("Rollouts saved to: %s", rollouts_path)
+
+    if skipped_empty_gold or skipped_gold_failed:
+        logging.info(
+            "Skipped examples: empty_gold=%d, gold_failed=%d",
+            skipped_empty_gold,
+            skipped_gold_failed,
+        )
 
 
 if __name__ == "__main__":
